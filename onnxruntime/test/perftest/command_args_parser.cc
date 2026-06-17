@@ -161,7 +161,10 @@ ABSL_FLAG(std::string, i, "",
           "  [SNPE only] [priority]: execution priority, options: 'low', 'normal'. \n"
           "  [SNPE only] [buffer_type]: options: 'TF8', 'TF16', 'UINT8', 'FLOAT', 'ITENSOR'. default: ITENSOR'. \n"
           "  [SNPE only] [enable_init_cache]: enable SNPE init caching feature, set to 1 to enabled it. Disabled by default. \n"
-          "  [Example] [For SNPE EP] -e snpe -i \"runtime|CPU priority|low\" \n");
+          "  [Example] [For SNPE EP] -e snpe -i \"runtime|CPU priority|low\" \n"
+          "\n"
+          "  [WebGPU only] [enableGraphCapture]: Enable WebGPU graph capture, options: '0', '1', default: '0'. \n"
+          "  [Example] [For WebGPU EP] -e webgpu -i \"enableGraphCapture|1\" \n");
 ABSL_FLAG(int, S, DefaultPerformanceTestConfig().run_config.random_seed_for_input_data, "Given random seed, to produce the same input data. This defaults to -1(no initialize).");
 ABSL_FLAG(std::string, T, "", "Specifies intra op thread affinity string.");
 ABSL_FLAG(std::string, C, "",

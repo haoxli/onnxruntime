@@ -19,6 +19,15 @@ class OnnxRuntimeTestSession : public TestSession {
   OnnxRuntimeTestSession(Ort::Env& env, std::random_device& rd, const PerformanceTestConfig& performance_test_config,
                          const TestModelInfo& m);
 
+#ifdef USE_WEBGPU
+  // Lazily set up the persistent IO binding with GPU input/output tensors and CPU staging buffers
+  // used for WebGPU graph capture/replay. Called on the first inference once the CPU inputs are
+  // available (inputs are preloaded after construction).
+  void InitializeWebGpuIoBinding();
+  // Run inference using the WebGPU IO binding and copy GPU outputs back to CPU to simulate real usage.
+  RunTiming RunWithWebGpuIoBinding();
+#endif
+
   void PreLoadTestData(size_t test_data_id, size_t input_id, Ort::Value&& value) override {
     if (test_inputs_.size() < test_data_id + 1) {
       test_inputs_.resize(test_data_id + 1);
@@ -60,6 +69,16 @@ class OnnxRuntimeTestSession : public TestSession {
   std::string device_memory_name_;  // Device memory type name to use from the list in allocator.h
   const std::unordered_map<std::string, std::string>& run_config_entries_;
   bool has_dynamic_output_shapes_ = false;
+#ifdef USE_WEBGPU
+  // WebGPU graph capture support. When enabled, inference uses a persistent IO binding with all
+  // inputs/outputs in preallocated GPU memory (required so captured commands reference stable
+  // buffers across replays). The GPU outputs are copied back to CPU each run to simulate real usage.
+  Ort::Env* env_ = nullptr;  // Used for cross-device (GPU<->CPU) tensor copies via OrtApi::CopyTensors.
+  bool enable_webgpu_graph_capture_ = false;
+  Ort::IoBinding webgpu_io_binding_{nullptr};
+  std::vector<Ort::Value> webgpu_gpu_inputs_;   // persistent GPU input buffers bound once
+  std::vector<Ort::Value> webgpu_cpu_outputs_;  // CPU staging tensors that receive the GPU outputs
+#endif
 #if defined(USE_CUDA) || defined(USE_TENSORRT) || defined(USE_NV)
   cudaStream_t stream_;  // Device stream if required by IO bindings
 #endif

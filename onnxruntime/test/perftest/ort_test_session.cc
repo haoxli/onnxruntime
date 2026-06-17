@@ -42,6 +42,11 @@ namespace onnxruntime {
 namespace perftest {
 
 RunTiming OnnxRuntimeTestSession::Run() {
+#ifdef USE_WEBGPU
+  if (enable_webgpu_graph_capture_) {
+    return RunWithWebGpuIoBinding();
+  }
+#endif
   // Randomly pick one OrtValueArray from test_inputs_. (NOT ThreadSafe)
   const std::uniform_int_distribution<int>::param_type p(0, static_cast<int>(test_inputs_.size() - 1));
   const size_t id = static_cast<size_t>(dist_(rand_engine_, p));
@@ -91,6 +96,90 @@ RunTiming OnnxRuntimeTestSession::Run() {
   return timing;
 }
 
+#ifdef USE_WEBGPU
+void OnnxRuntimeTestSession::InitializeWebGpuIoBinding() {
+  // Locate the WebGPU EP device so we can obtain its GPU allocator and memory info.
+  Ort::ConstMemoryInfo gpu_mem_info{nullptr};
+  for (const auto& ep_device : env_->GetEpDevices()) {
+    if (std::string(ep_device.EpName()) == onnxruntime::kWebGpuExecutionProvider) {
+      gpu_mem_info = ep_device.GetMemoryInfo(OrtDeviceMemoryType_DEFAULT);
+      break;
+    }
+  }
+  if (gpu_mem_info == nullptr) {
+    ORT_THROW("Could not find the WebGPU EP device or its GPU memory info for graph capture.");
+  }
+
+  Ort::UnownedAllocator gpu_allocator = env_->GetSharedAllocator(gpu_mem_info);
+
+  webgpu_io_binding_ = Ort::IoBinding(session_);
+
+  // Allocate persistent GPU input tensors and seed them with the (CPU) preloaded input data.
+  // The buffers are bound once and reused across all runs so captured commands stay valid on replay.
+  auto& cpu_inputs = test_inputs_.at(0);
+  webgpu_gpu_inputs_.reserve(input_names_.size());
+  for (size_t i = 0; i < input_names_.size(); ++i) {
+    auto type_and_shape = cpu_inputs[i].GetTensorTypeAndShapeInfo();
+    std::vector<int64_t> shape = type_and_shape.GetShape();
+    Ort::Value gpu_input = Ort::Value::CreateTensor(gpu_allocator, shape.data(), shape.size(),
+                                                    type_and_shape.GetElementType());
+    Ort::ThrowOnError(env_->CopyTensor(cpu_inputs[i], gpu_input, nullptr));
+    webgpu_io_binding_.BindInput(input_names_[i], gpu_input);
+    webgpu_gpu_inputs_.emplace_back(std::move(gpu_input));
+  }
+
+  // Bind GPU output tensors and prepare CPU staging tensors that receive a copy each run.
+  Ort::AllocatorWithDefaultOptions cpu_allocator;
+  webgpu_cpu_outputs_.reserve(output_names_raw_ptr.size());
+  for (size_t i = 0; i < output_names_raw_ptr.size(); ++i) {
+    Ort::TypeInfo type_info = session_.GetOutputTypeInfo(i);
+    auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
+    std::vector<int64_t> output_shape = tensor_info.GetShape();
+    // Free/dynamic dims are not supported with graph capture (output buffers must be preallocated).
+    std::transform(output_shape.begin(), output_shape.end(), output_shape.begin(),
+                   [](int64_t d) { return d < 0 ? 1 : d; });
+
+    Ort::Value gpu_output = Ort::Value::CreateTensor(gpu_allocator, output_shape.data(), output_shape.size(),
+                                                     tensor_info.GetElementType());
+    webgpu_io_binding_.BindOutput(output_names_raw_ptr[i], gpu_output);
+    outputs_[i] = std::move(gpu_output);
+
+    webgpu_cpu_outputs_.emplace_back(
+        Ort::Value::CreateTensor(cpu_allocator, output_shape.data(), output_shape.size(),
+                                 tensor_info.GetElementType()));
+  }
+
+  webgpu_io_binding_.SynchronizeInputs();
+}
+
+RunTiming OnnxRuntimeTestSession::RunWithWebGpuIoBinding() {
+  if (webgpu_io_binding_ == nullptr) {
+    InitializeWebGpuIoBinding();
+  }
+
+  Ort::RunOptions run_options;
+  for (const auto& kv : run_config_entries_) {
+    run_options.AddConfigEntry(kv.first.c_str(), kv.second.c_str());
+  }
+  // Use a stable graph annotation id so the WebGPU EP captures the graph and replays it on later runs.
+  run_options.AddConfigEntry(kOrtRunOptionsConfigCudaGraphAnnotation, "0");
+
+  RunTiming timing;
+  auto start = std::chrono::high_resolution_clock::now();
+  session_.Run(run_options, webgpu_io_binding_);
+  timing.submit_timing = std::chrono::high_resolution_clock::now() - start;
+  webgpu_io_binding_.SynchronizeOutputs();
+
+  // Copy the GPU outputs back to CPU to simulate the real usage pattern where the application
+  // consumes results on the host.
+  for (size_t i = 0; i < outputs_.size(); ++i) {
+    Ort::ThrowOnError(env_->CopyTensor(outputs_[i], webgpu_cpu_outputs_[i], nullptr));
+  }
+  timing.total_timing = std::chrono::high_resolution_clock::now() - start;
+  return timing;
+}
+#endif  // USE_WEBGPU
+
 OnnxRuntimeTestSession::OnnxRuntimeTestSession(Ort::Env& env, std::random_device& rd,
                                                const PerformanceTestConfig& performance_test_config,
                                                const TestModelInfo& m)
@@ -100,6 +189,9 @@ OnnxRuntimeTestSession::OnnxRuntimeTestSession(Ort::Env& env, std::random_device
       input_length_(m.GetInputCount()),
       run_config_entries_(performance_test_config.run_config.run_config_entries) {
   Ort::SessionOptions session_options;
+#ifdef USE_WEBGPU
+  env_ = &env;
+#endif
 
   // Add EP devices if any (created by plugin EP)
   if (!performance_test_config.registered_plugin_eps.empty()) {
@@ -600,7 +692,28 @@ select from 'TF8', 'TF16', 'UINT8', 'FLOAT', 'ITENSOR'. \n)");
 #endif
   } else if (provider_name_ == onnxruntime::kWebGpuExecutionProvider) {
 #ifdef USE_WEBGPU
-    session_options.AppendExecutionProvider("WebGPU", {});
+#ifdef _MSC_VER
+    std::string option_string = ToUTF8String(performance_test_config.run_config.ep_runtime_config_string);
+#else
+    std::string option_string = performance_test_config.run_config.ep_runtime_config_string;
+#endif
+    ParseSessionConfigs(option_string, provider_options, {"enableGraphCapture"});
+    for (const auto& provider_option : provider_options) {
+      const std::string& key = provider_option.first;
+      const std::string& value = provider_option.second;
+      if (key == "enableGraphCapture") {
+        std::set<std::string> supported_values = {"0", "1"};
+        if (supported_values.find(value) != supported_values.end()) {
+          enable_webgpu_graph_capture_ = (value == "1");
+        } else {
+          ORT_THROW(
+              "[ERROR] [WebGPU] You have selcted an invalid value for the key 'enableGraphCapture'. "
+              "Select from '0', or '1' \n");
+        }
+      }
+    }
+
+    session_options.AppendExecutionProvider("WebGPU", provider_options);
 #else
     ORT_THROW("WebGPU is not supported in this build\n");
 #endif
